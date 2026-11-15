@@ -602,6 +602,49 @@ mod tests {
     use super::*;
     use futures::FutureExt;
 
+    /// Qualification probe: private query pools admit independent full envelopes.
+    #[test]
+    fn contexts_have_independent_memory_envelopes_issue_724() {
+        const LIMIT: u64 = 32 * 1024 * 1024;
+        let contexts: Vec<_> = (0..3).map(|_| QueryContext::new(LIMIT).unwrap()).collect();
+        let reservations: Vec<_> = contexts
+            .iter()
+            .map(|context| {
+                let pool: Arc<dyn MemoryPool> = Arc::clone(&context.pool) as _;
+                let reservation = MemoryConsumer::new("issue 724 query").register(&pool);
+                reservation.try_grow(LIMIT as usize).unwrap();
+                reservation
+            })
+            .collect();
+        let total: usize = contexts.iter().map(|context| context.pool.reserved()).sum();
+        assert_eq!(total, 3 * LIMIT as usize);
+        assert!(
+            contexts
+                .iter()
+                .all(|context| context.pool.reserved() == LIMIT as usize)
+        );
+        println!("issue 724: contexts=3 per_query_limit={LIMIT} total_reserved={total}");
+        drop(reservations);
+        assert!(contexts.iter().all(|context| context.pool.reserved() == 0));
+    }
+
+    /// DataFusion requires infallible growth to succeed, even beyond a pool's limit.
+    #[test]
+    fn infallible_pool_growth_exceeds_the_nominal_limit_issue_724() {
+        let context = QueryContext::new(1_024).unwrap();
+        let pool: Arc<dyn MemoryPool> = Arc::clone(&context.pool) as _;
+        let reservation = MemoryConsumer::new("issue 724 infallible growth").register(&pool);
+        reservation.grow(2_048);
+        assert!(matches!(pool.memory_limit(), MemoryLimit::Finite(1_024)));
+        assert_eq!(pool.reserved(), 2_048);
+        println!(
+            "issue 724: nominal_limit=1024 infallible_reserved={}",
+            pool.reserved()
+        );
+        drop(reservation);
+        assert_eq!(pool.reserved(), 0);
+    }
+
     #[test]
     fn load_reuse_uses_only_headroom_after_mandatory_admission() {
         use datafusion::execution::memory_pool::GreedyMemoryPool;
