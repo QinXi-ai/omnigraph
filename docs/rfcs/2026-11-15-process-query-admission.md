@@ -29,8 +29,8 @@ This specifies the execution-admission part of
 [Engine settlement and resource bounds](2026-10-01-engine-settlement-and-resource-bounds.md)
 for [#724](https://github.com/ModernRelay/omnigraph/issues/724). It retains that
 RFC's ownership and native-settlement requirements. The accounted unit is
-reserved execution bytes; deployments also need headroom for caches, outputs,
-the allocator and runtime.
+reserved execution bytes, including traversal adjacency retained after a query.
+Deployments also need headroom for other caches, outputs, the allocator and runtime.
 
 ## Motivation
 
@@ -138,6 +138,33 @@ by these paths. Paths still outside an enforceable envelope remain documented
 coverage gaps; configuring this budget must not silently claim their memory is
 included. A complete #724 implementation closes those gaps through the existing
 owners or a qualified public substrate hook, without vendoring Lance.
+
+### Shared traversal adjacency
+
+A cold traversal can exhaust memory while constructing its adjacency index even
+when its DataFusion pool is small. Concurrent misses on one handle share a
+build under [#1540](https://github.com/ModernRelay/omnigraph/pull/1540).
+Keep that gate while the cost of concurrent builds for distinct scopes is
+unqualified. Each reader still needs its own execution envelope. Only the
+caller that must construct an index needs a build allowance.
+
+Treat the shared build as an independent child. After the cache recheck and
+before dispatching its load or edge scan, reserve a bounded build envelope
+from the same process owner. Refuse immediately if it cannot be admitted.
+Within the envelope, check capacity before each allocation or growth, including
+overlap between old and replacement buffers. The scan path covers endpoint
+dictionaries, edge pairs, reverse pairs and both adjacency arrays. The artifact
+path covers encoded bytes overlapping with decoded structures. A fallback scan
+can reuse capacity once decode buffers drop. If the next allocation exceeds
+the admitted allowance, return a typed resource-limit error before allocating.
+
+On publication, transfer the retained portion of the existing reservation to
+the shared index. Release scratch capacity as its buffers drop. Cache hits,
+including historical reads, clone the owner without reserving those bytes
+again. Use retained bytes for eviction and try dropping evictable entries
+before reporting capacity contention. An entry can also be held by the shelf
+or a reader. Only the last owner releases its charge. This lets an idle cache
+yield capacity and keeps an evicted index counted while a query still uses it.
 
 ### Lifetime
 
@@ -289,6 +316,16 @@ Extend the existing owners in [Testing](../dev/testing.md):
 - `integration/engine_v2_memory.rs` for two graph handles sharing capacity,
   inspected/replayed queries, a smaller query admitted while a larger one is
   refused, and unchanged logical results and graph state after refusal.
+- Use the cold traversal from [#1539](https://github.com/ModernRelay/omnigraph/issues/1539)
+  with a small build allowance. Exercise both a scan build and a persisted
+  decode. Assert refusal before the allocation that would exceed the allowance,
+  followed by a successful small query on the same server. Record peak RSS and
+  reserved bytes separately when replaying the original workload.
+- Extend the concurrent-miss test from #1540. Eight readers acquiring the same
+  cold index hold one build charge. Pin the published index in a historical
+  reader, evict every cache reference, and verify that its retained charge is
+  released only when the reader drops it. Repeat the build with cancellation
+  and a failed decode to check scratch recovery.
 - Ordered-cursor, loader and query-memory owners for nested allowances, search
   passes, load reruns and pre-effect refusal. Extend native lifetime guards for
   retained I/O and CPU work after a dropped stream.
