@@ -146,23 +146,29 @@ when its DataFusion pool is small. Concurrent misses on one handle share a
 build under [#1540](https://github.com/ModernRelay/omnigraph/pull/1540).
 Keep that gate while the cost of concurrent builds for distinct scopes is
 unqualified. Each reader still needs its own execution envelope. Only the
-caller that must construct an index needs a build allowance.
+caller that must construct an index needs a build allowance. With the process
+budget unset, successive historical queries can leave several full indexes
+resident under the entry-count limit; this rollout leaves that default risk open.
 
 Treat the shared build as an independent child. After the cache recheck and
 before dispatching its load or edge scan, reserve a bounded build envelope
 from the same process owner. Refuse immediately if it cannot be admitted.
 Within the envelope, check capacity before each allocation or growth, including
 overlap between old and replacement buffers. The scan path covers endpoint
-dictionaries, edge pairs, reverse pairs and both adjacency arrays. The artifact
-path covers encoded bytes overlapping with decoded structures. A fallback scan
+dictionaries, edge pairs, reverse pairs and both adjacency arrays. Account
+for allocated capacity, including duplicate ID storage and hash-table overhead.
+The artifact path covers the encoded buffer overlapping the full-catalog decode
+even when the query requests only one edge type. A fallback scan
 can reuse capacity once decode buffers drop. If the next allocation exceeds
 the admitted allowance, return a typed resource-limit error before allocating.
 
 On publication, transfer the retained portion of the existing reservation to
 the shared index. Release scratch capacity as its buffers drop. Cache hits,
 including historical reads, clone the owner without reserving those bytes
-again. Use retained bytes for eviction and try dropping evictable entries
-before reporting capacity contention. An entry can also be held by the shelf
+again. Cloning a shared handle retains its charge; a deep copy needs a fresh
+reservation before allocation. Use retained bytes for eviction. On contention,
+release the admission lock before visiting caches, drop evictable entries,
+then retry admission once and refuse if capacity is still held. An entry can also be held by the shelf
 or a reader. Only the last owner releases its charge. This lets an idle cache
 yield capacity and keeps an evicted index counted while a query still uses it.
 
